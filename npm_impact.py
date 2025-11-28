@@ -86,17 +86,18 @@ def clean(s: Optional[str]) -> Optional[str]:
     return v or None
 
 
-def any_repo_matches(
+def get_matching_repo_names(
     token: str,
     deployment_id: str,
     dependency_name: Optional[str],
     dependency_version: Optional[str],
     max_retries: int = 3,
     retry_backoff_seconds: float = 2.0,
-) -> bool:
+) -> list[str]:
     """
     Calls POST /deployments/{deploymentId}/dependencies/repositories with a dependencyFilter.
-    Follows cursor pagination until no more results. Returns True if ANY repositories found.
+    Follows cursor pagination until no more results. Returns a list of repository names
+    that use the given dependency/version.
     """
     url = f"{API_BASE}/deployments/{deployment_id}/dependencies/repositories"
     headers = {
@@ -115,10 +116,14 @@ def any_repo_matches(
 
     cursor = None
     session = requests.Session()
+    repo_names: list[str] = []
 
     while True:
         if cursor is not None:
             body["cursor"] = cursor
+        else:
+            # Ensure we don't keep an old cursor across iterations
+            body.pop("cursor", None)
 
         # simple retry on transient issues
         for attempt in range(1, max_retries + 1):
@@ -131,7 +136,7 @@ def any_repo_matches(
                         f"{dependency_name} {dependency_version}: {resp.text}",
                         file=sys.stderr,
                     )
-                    return False
+                    return []
                 resp.raise_for_status()
                 data = resp.json()
                 break
@@ -146,7 +151,7 @@ def any_repo_matches(
                         f"Error: giving up on {dependency_name} {dependency_version}: {e}",
                         file=sys.stderr,
                     )
-                    return False
+                    return []
                 time.sleep(retry_backoff_seconds * attempt)
 
         # Default/known keys: your example shows 'repositorySummaries'
@@ -156,15 +161,24 @@ def any_repo_matches(
             or data.get("results")
             or []
         )
-        if repos:
-            return True
+
+        for r in repos:
+            name = (
+                r.get("name")
+                or r.get("repositoryName")
+                or r.get("slug")
+                or r.get("id")
+            )
+            if name:
+                repo_names.append(str(name))
 
         cursor = data.get("cursor")
         has_more = data.get("hasMore")
         if not cursor and not has_more:
             break
 
-    return False
+    return repo_names
+
 
 
 def main():
@@ -211,6 +225,9 @@ def main():
             out_fields = list(reader.fieldnames)
             if "Impact" not in out_fields:
                 out_fields.append("Impact")
+            if "Repositories" not in out_fields:
+                out_fields.append("Repositories")
+
 
             with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f_out:
                 writer = csv.DictWriter(f_out, fieldnames=out_fields)
@@ -235,18 +252,19 @@ def main():
                         file=sys.stderr,
                     )
 
-                    impacted = any_repo_matches(
+                    repo_names = get_matching_repo_names(
                         token=token,
                         deployment_id=deployment_id,
                         dependency_name=dep_name,
                         dependency_version=dep_ver,
                     )
+                    impacted = bool(repo_names)
 
-
-                    # ---- NEW: Print alert if matched ----
+                    # ---- Print alert with repo names ----
                     if impacted:
+                        repo_list = ", ".join(sorted(set(repo_names)))
                         print(
-                            f"🚨 IMPACT MATCH: {dep_name} {dep_ver or ''} appears in your deployment!",
+                            f"🚨 IMPACT MATCH: {dep_name} {dep_ver or ''} used in repositories: {repo_list}",
                             file=sys.stderr,
                         )
                     else:
@@ -256,8 +274,9 @@ def main():
                         )
                     # --------------------------------------
 
-
                     out_row["Impact"] = "Yes" if impacted else "No"
+                    out_row["Repositories"] = ", ".join(sorted(set(repo_names))) if impacted else ""
+
                     writer.writerow(out_row)
 
     except FileNotFoundError:
